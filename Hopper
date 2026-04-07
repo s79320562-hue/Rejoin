@@ -1,0 +1,451 @@
+
+--[[
+    Made by Shadow
+    Rivals FFA Hopper v3
+
+    - Hops to a different server when players drop below your set limit
+    - Never goes to the same server twice
+    - Auto reconnects if you get kicked or disconnected
+    - Works on PC and Mobile
+]]
+
+local Players          = game:GetService("Players")
+local TeleportService  = game:GetService("TeleportService")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService      = game:GetService("HttpService")
+local CoreGui          = game:GetService("CoreGui")
+
+local me           = Players.LocalPlayer
+local placeId      = game.PlaceId
+local isMobile     = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+
+-- all servers we have already been in this session so we skip them
+local visited = {}
+visited[tostring(game.JobId)] = true
+
+local cfg = {
+    threshold  = 5,    -- hop if current server has fewer players than this
+    checkEvery = 5,    -- seconds between each check
+    enabled    = false,
+}
+
+local hopping = false
+
+------------------------------------------------------------------------
+-- Utility: fetch a server list page from Roblox public API
+------------------------------------------------------------------------
+
+local function fetchServers(cursor)
+    local url = "https://games.roblox.com/v1/games/"
+        .. tostring(placeId)
+        .. "/servers/Public?sortOrder=Desc&excludeFullGames=false&limit=100"
+
+    if cursor and cursor ~= "" then
+        url = url .. "&cursor=" .. cursor
+    end
+
+    -- game:HttpGet works in most executors where HttpService is blocked
+    local ok, result = pcall(game.HttpGet, game, url)
+    if not ok or not result then
+        return nil, nil
+    end
+
+    local ok2, decoded = pcall(HttpService.JSONDecode, HttpService, result)
+    if not ok2 or type(decoded) ~= "table" then
+        return nil, nil
+    end
+
+    return decoded.data, decoded.nextPageCursor
+end
+
+------------------------------------------------------------------------
+-- Pick a server that:
+--   1. Has at least cfg.threshold players
+--   2. Is not one we have already visited
+------------------------------------------------------------------------
+
+local function pickServer()
+    local cursor = nil
+    local attempts = 0
+
+    repeat
+        attempts = attempts + 1
+        local servers, nextCursor = fetchServers(cursor)
+
+        if not servers then
+            break
+        end
+
+        -- shuffle so we do not always land on the same first result
+        for i = #servers, 2, -1 do
+            local j = math.random(1, i)
+            servers[i], servers[j] = servers[j], servers[i]
+        end
+
+        for _, s in ipairs(servers) do
+            local id      = tostring(s.id or "")
+            local playing = tonumber(s.playing) or 0
+
+            if id ~= "" and not visited[id] and playing >= cfg.threshold then
+                return id
+            end
+        end
+
+        cursor = nextCursor
+
+    until not cursor or cursor == "" or attempts >= 4
+
+    return nil
+end
+
+------------------------------------------------------------------------
+-- Teleport the player to a specific server job ID
+------------------------------------------------------------------------
+
+local function teleportTo(jobId)
+    -- mark it visited before teleporting so if something fails we do not
+    -- try the same one again
+    visited[jobId] = true
+
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(placeId, jobId, me)
+    end)
+
+    return ok, err
+end
+
+------------------------------------------------------------------------
+-- Main hop function
+------------------------------------------------------------------------
+
+local statusLbl  -- forward declare, set after GUI builds
+local countLbl
+
+local function setStatus(text, r, g, b)
+    if statusLbl then
+        statusLbl.Text       = "Status:  " .. text
+        statusLbl.TextColor3 = Color3.fromRGB(r or 140, g or 140, b or 140)
+    end
+end
+
+local function doHop(reason)
+    if hopping then return end
+    hopping = true
+
+    setStatus(reason, 220, 175, 55)
+    task.wait(5) -- 5 second delay before hopping
+
+    local jobId = pickServer()
+
+    if not jobId then
+        setStatus("No valid server found, retrying...", 210, 55, 55)
+        task.wait(8)
+        hopping = false
+        return
+    end
+
+    setStatus("Hopping to new server...", 255, 150, 45)
+    task.wait(1)
+
+    local ok, err = teleportTo(jobId)
+
+    if not ok then
+        setStatus("Teleport failed, trying again...", 210, 55, 55)
+        task.wait(6)
+        hopping = false
+    end
+    -- if teleport succeeded the game will handle the rest
+end
+
+------------------------------------------------------------------------
+-- Kick / disconnect detection
+------------------------------------------------------------------------
+
+TeleportService.TeleportInitFailed:Connect(function(player, result)
+    if not cfg.enabled then return end
+    setStatus("Teleport failed, reconnecting in 5s...", 210, 55, 55)
+    task.wait(5)
+    hopping = false
+    doHop("Reconnecting after teleport failure...")
+end)
+
+me.OnTeleport:Connect(function(state)
+    if state == Enum.TeleportState.Failed then
+        if not cfg.enabled then return end
+        setStatus("Connection lost, reconnecting in 5s...", 210, 55, 55)
+        task.wait(5)
+        hopping = false
+        doHop("Reconnecting after disconnect...")
+    end
+end)
+
+-- safety net in case the player gets removed from the game unexpectedly
+local heartbeatConn
+heartbeatConn = RunService.Heartbeat:Connect(function()
+    if not cfg.enabled then return end
+    if not me or not me.Parent then
+        heartbeatConn:Disconnect()
+        setStatus("Removed from game, reconnecting...", 210, 55, 55)
+        task.wait(5)
+        hopping = false
+        doHop("Reconnecting after kick/removal...")
+    end
+end)
+
+------------------------------------------------------------------------
+-- GUI
+------------------------------------------------------------------------
+
+if CoreGui:FindFirstChild("ShadowHopper") then
+    CoreGui:FindFirstChild("ShadowHopper"):Destroy()
+end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name           = "ShadowHopper"
+screenGui.ResetOnSpawn   = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent         = CoreGui
+
+local win = Instance.new("Frame")
+win.Name             = "Win"
+win.Size             = UDim2.new(0, 268, 0, 232)
+win.Position         = isMobile
+    and UDim2.new(0.5, -134, 0, 70)
+    or  UDim2.new(0.5, -134, 0, 10)
+win.BackgroundColor3 = Color3.fromRGB(13, 13, 17)
+win.BorderSizePixel  = 0
+win.Active           = true
+win.Draggable        = not isMobile
+win.Parent           = screenGui
+
+Instance.new("UICorner", win).CornerRadius = UDim.new(0, 10)
+
+local stroke = Instance.new("UIStroke")
+stroke.Color     = Color3.fromRGB(88, 62, 175)
+stroke.Thickness = 1.5
+stroke.Parent    = win
+
+-- header bar
+local hdr = Instance.new("Frame")
+hdr.Size             = UDim2.new(1, 0, 0, 40)
+hdr.BackgroundColor3 = Color3.fromRGB(21, 17, 42)
+hdr.BorderSizePixel  = 0
+hdr.Parent           = win
+
+Instance.new("UICorner", hdr).CornerRadius = UDim.new(0, 10)
+
+-- patch to square off the header's bottom corners
+local hdrPatch = Instance.new("Frame")
+hdrPatch.Size             = UDim2.new(1, 0, 0, 12)
+hdrPatch.Position         = UDim2.new(0, 0, 1, -12)
+hdrPatch.BackgroundColor3 = Color3.fromRGB(21, 17, 42)
+hdrPatch.BorderSizePixel  = 0
+hdrPatch.Parent           = hdr
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size               = UDim2.new(1, -14, 1, 0)
+titleLabel.Position           = UDim2.new(0, 12, 0, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.TextColor3         = Color3.fromRGB(192, 162, 255)
+titleLabel.TextSize           = isMobile and 14 or 13
+titleLabel.Font               = Enum.Font.GothamBold
+titleLabel.Text               = "Made by Shadow  -  FFA Hopper"
+titleLabel.TextXAlignment     = Enum.TextXAlignment.Left
+titleLabel.Parent             = hdr
+
+-- status label (assigned to the forward declared variable)
+statusLbl = Instance.new("TextLabel")
+statusLbl.Size               = UDim2.new(1, -16, 0, 20)
+statusLbl.Position           = UDim2.new(0, 10, 0, 48)
+statusLbl.BackgroundTransparency = 1
+statusLbl.TextColor3         = Color3.fromRGB(138, 138, 138)
+statusLbl.TextSize           = isMobile and 13 or 12
+statusLbl.Font               = Enum.Font.Gotham
+statusLbl.Text               = "Status:  Idle"
+statusLbl.TextXAlignment     = Enum.TextXAlignment.Left
+statusLbl.Parent             = win
+
+countLbl = Instance.new("TextLabel")
+countLbl.Size               = UDim2.new(1, -16, 0, 20)
+countLbl.Position           = UDim2.new(0, 10, 0, 70)
+countLbl.BackgroundTransparency = 1
+countLbl.TextColor3         = Color3.fromRGB(105, 105, 105)
+countLbl.TextSize           = isMobile and 13 or 12
+countLbl.Font               = Enum.Font.Gotham
+countLbl.Text               = "Players in server:  " .. #Players:GetPlayers()
+countLbl.TextXAlignment     = Enum.TextXAlignment.Left
+countLbl.Parent             = win
+
+local divider = Instance.new("Frame")
+divider.Size             = UDim2.new(1, -20, 0, 1)
+divider.Position         = UDim2.new(0, 10, 0, 97)
+divider.BackgroundColor3 = Color3.fromRGB(48, 42, 78)
+divider.BorderSizePixel  = 0
+divider.Parent           = win
+
+local hopLabel = Instance.new("TextLabel")
+hopLabel.Size               = UDim2.new(1, -16, 0, 20)
+hopLabel.Position           = UDim2.new(0, 10, 0, 107)
+hopLabel.BackgroundTransparency = 1
+hopLabel.TextColor3         = Color3.fromRGB(192, 162, 255)
+hopLabel.TextSize           = isMobile and 13 or 12
+hopLabel.Font               = Enum.Font.GothamBold
+hopLabel.Text               = "Hop when players below:"
+hopLabel.TextXAlignment     = Enum.TextXAlignment.Left
+hopLabel.Parent             = win
+
+local BW = isMobile and 42 or 32
+local BH = isMobile and 32 or 26
+local NW = isMobile and 58 or 48
+
+local minusBtn = Instance.new("TextButton")
+minusBtn.Size             = UDim2.new(0, BW, 0, BH)
+minusBtn.Position         = UDim2.new(0, 10, 0, 132)
+minusBtn.BackgroundColor3 = Color3.fromRGB(62, 36, 115)
+minusBtn.TextColor3       = Color3.fromRGB(240, 240, 240)
+minusBtn.Text             = "-"
+minusBtn.TextSize         = isMobile and 20 or 17
+minusBtn.Font             = Enum.Font.GothamBold
+minusBtn.BorderSizePixel  = 0
+minusBtn.Parent           = win
+Instance.new("UICorner", minusBtn).CornerRadius = UDim.new(0, 6)
+
+local numDisplay = Instance.new("TextLabel")
+numDisplay.Size             = UDim2.new(0, NW, 0, BH)
+numDisplay.Position         = UDim2.new(0, 10 + BW + 5, 0, 132)
+numDisplay.BackgroundColor3 = Color3.fromRGB(22, 20, 38)
+numDisplay.TextColor3       = Color3.fromRGB(222, 202, 255)
+numDisplay.Text             = tostring(cfg.threshold)
+numDisplay.TextSize         = isMobile and 15 or 13
+numDisplay.Font             = Enum.Font.GothamBold
+numDisplay.BorderSizePixel  = 0
+numDisplay.Parent           = win
+Instance.new("UICorner", numDisplay).CornerRadius = UDim.new(0, 6)
+
+local plusBtn = Instance.new("TextButton")
+plusBtn.Size             = UDim2.new(0, BW, 0, BH)
+plusBtn.Position         = UDim2.new(0, 10 + BW + 5 + NW + 5, 0, 132)
+plusBtn.BackgroundColor3 = Color3.fromRGB(62, 36, 115)
+plusBtn.TextColor3       = Color3.fromRGB(240, 240, 240)
+plusBtn.Text             = "+"
+plusBtn.TextSize         = isMobile and 20 or 17
+plusBtn.Font             = Enum.Font.GothamBold
+plusBtn.BorderSizePixel  = 0
+plusBtn.Parent           = win
+Instance.new("UICorner", plusBtn).CornerRadius = UDim.new(0, 6)
+
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size             = UDim2.new(1, -20, 0, isMobile and 40 or 32)
+toggleBtn.Position         = UDim2.new(0, 10, 0, 188)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(48, 34, 96)
+toggleBtn.TextColor3       = Color3.fromRGB(185, 165, 255)
+toggleBtn.Text             = "Start Hopper"
+toggleBtn.TextSize         = isMobile and 14 or 13
+toggleBtn.Font             = Enum.Font.GothamBold
+toggleBtn.BorderSizePixel  = 0
+toggleBtn.Parent           = win
+Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 8)
+
+------------------------------------------------------------------------
+-- Mobile touch drag
+------------------------------------------------------------------------
+
+if isMobile then
+    local dragging, dragStart, startPos = false, nil, nil
+
+    win.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch then
+            dragging  = true
+            dragStart = inp.Position
+            startPos  = win.Position
+        end
+    end)
+
+    win.InputChanged:Connect(function(inp)
+        if dragging and inp.UserInputType == Enum.UserInputType.Touch then
+            local d = inp.Position - dragStart
+            win.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y
+            )
+        end
+    end)
+
+    win.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+end
+
+------------------------------------------------------------------------
+-- Button events
+------------------------------------------------------------------------
+
+minusBtn.MouseButton1Click:Connect(function()
+    if cfg.threshold > 2 then
+        cfg.threshold   = cfg.threshold - 1
+        numDisplay.Text = tostring(cfg.threshold)
+    end
+end)
+
+plusBtn.MouseButton1Click:Connect(function()
+    if cfg.threshold < 20 then
+        cfg.threshold   = cfg.threshold + 1
+        numDisplay.Text = tostring(cfg.threshold)
+    end
+end)
+
+toggleBtn.MouseButton1Click:Connect(function()
+    cfg.enabled = not cfg.enabled
+
+    if cfg.enabled then
+        toggleBtn.Text             = "Stop Hopper"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(95, 26, 52)
+        toggleBtn.TextColor3       = Color3.fromRGB(255, 145, 145)
+        setStatus("Running, checks every " .. cfg.checkEvery .. "s", 88, 208, 118)
+    else
+        toggleBtn.Text             = "Start Hopper"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(48, 34, 96)
+        toggleBtn.TextColor3       = Color3.fromRGB(185, 165, 255)
+        hopping = false
+        setStatus("Idle", 138, 138, 138)
+    end
+end)
+
+------------------------------------------------------------------------
+-- Live player count
+------------------------------------------------------------------------
+
+local function refreshCount()
+    countLbl.Text = "Players in server:  " .. #Players:GetPlayers()
+end
+
+Players.PlayerAdded:Connect(refreshCount)
+Players.PlayerRemoving:Connect(function()
+    task.wait(0.3)
+    refreshCount()
+end)
+
+------------------------------------------------------------------------
+-- Check loop
+------------------------------------------------------------------------
+
+task.spawn(function()
+    while true do
+        task.wait(cfg.checkEvery)
+        refreshCount()
+
+        if cfg.enabled and not hopping then
+            local n = #Players:GetPlayers()
+            if n < cfg.threshold then
+                doHop("Only " .. n .. " players here, hopping in 5s...")
+            else
+                setStatus("Server OK  (" .. n .. " players)", 88, 208, 118)
+            end
+        end
+    end
+end)
+
+print("[Shadow Hopper] Script loaded.")
